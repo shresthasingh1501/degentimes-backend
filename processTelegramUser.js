@@ -79,7 +79,7 @@ export const processTelegramUser = async (user) => {
     }
 
     // --- 2. Construct Prompt ---
-    const prompt = `this is the news for today {${combinedNews}} form a message from this and send it to user id {${user.telegramid}} , title it as Degen Times - Daily Digest`;
+    const prompt = `this is the news for today {${combinedNews}} form a concise message from this and send it to user id {${user.telegramid}} , title it as Degen Times - Daily Digest`;
 
     // --- 3. Send POST Request ---
     let postAttempted = false;
