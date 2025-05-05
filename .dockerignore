@@ -1,0 +1,23 @@
+# .dockerignore
+
+# Ignore Node dependencies (they are installed in the container)
+node_modules
+
+# Ignore environment files (use Fly secrets instead)
+.env*
+*.env
+
+# Ignore Git directory
+.git
+.gitignore
+
+# Ignore Docker specific files
+Dockerfile
+.dockerignore
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Add any logs or temporary files you might generate locally
+*.log
