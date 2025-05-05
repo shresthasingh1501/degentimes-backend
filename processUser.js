@@ -94,8 +94,9 @@ export const processUser = async (user, forceRun = false) => {
     categoriesToProcess.forEach((cat) => {
         if (cat.needsApiCall) {
             openServProcessingAttempted = true;
-            const prompt = `Give me Web3 related news Titled ${cat.name} News : This will only contain Web3/Crypto news that happened today on the following crypto topics/items {${cat.items.join(', ')}} with each news section having a why it matters part`;
+            const prompt = `Give me news Titled ${cat.name} News : This will only contain news that happened today on the following crypto topics/items {${cat.items.join(', ')}} with each news section having a why it matters part`;
              console.log(`   - Queuing POST for ${cat.name}`);
+            // Use the general agent ID for all content types
             postPromises.push(postMessage(cat.workspaceId, config.openservAgentId, prompt));
             categoryInfoForGet.push({ ...cat });
         } else {
@@ -134,6 +135,7 @@ export const processUser = async (user, forceRun = false) => {
                 const catInfo = categoryInfoForGet[index];
                 if (postResult.status === 'fulfilled') {
                      console.log(`   - Queuing GET for ${catInfo.name}`);
+                     // Use the general agent ID for all content types
                     getPromises.push(getMessages(catInfo.workspaceId, config.openservAgentId));
                     categoryInfoForUpdate.push(catInfo);
                 }
@@ -153,7 +155,7 @@ export const processUser = async (user, forceRun = false) => {
                              updates[catInfo.updateKey] = agentResponse;
                          } else {
                               console.warn(`    - GET for ${catInfo.name} successful, but no agent response found.`);
-                             updates[catInfo.updateKey] = PLACEHOLDER_MESSAGE;
+                             updates[catInfo.updateKey] = PLACEHOLDER_MESSAGE; // Or maybe a "No news found" specific message
                          }
                      } else {
                          console.error(`    - GET for ${catInfo.name} failed: ${getResult.reason?.message || getResult.reason}`);
@@ -170,17 +172,26 @@ export const processUser = async (user, forceRun = false) => {
         console.log(` -> No API calls needed for this user.`);
     }
 
+    // Always update last_job timestamp if processing was attempted or forced
     updates.last_job = new Date().toISOString();
 
-    if (Object.keys(updates).length === 0) {
-         console.log(` -> [${user.user_email}] No changes detected, skipping Supabase update.`);
+    // Check if there are any actual changes to update besides last_job
+    const updateKeys = Object.keys(updates);
+    if (updateKeys.length === 1 && updateKeys[0] === 'last_job' && !openServProcessingAttempted) {
+         console.log(` -> [${user.user_email}] Only last_job updated and no API calls attempted, skipping Supabase write.`);
+         // If only last_job is being updated AND no API calls were even tried (meaning content was placeholders already)
+         // we can potentially skip the DB write. Return true as the state is considered 'processed'.
          return true;
     }
+     if (updateKeys.length === 0) {
+           console.log(` -> [${user.user_email}] No changes detected, skipping Supabase update.`);
+           return true;
+     }
 
 
     let supabaseUpdateSuccess = false;
     try {
-        console.log(` -> Updating Supabase for ${user.user_email} with keys: ${Object.keys(updates).join(', ')}`);
+        console.log(` -> Updating Supabase for ${user.user_email} with keys: ${updateKeys.join(', ')}`);
         const { error: updateError } = await supabase
             .from('user_preferences')
             .update(updates)
@@ -188,7 +199,7 @@ export const processUser = async (user, forceRun = false) => {
 
         if (updateError) {
             console.error(`!!! [${user.user_email}] Supabase update FAILED:`, updateError.message);
-            console.error(`    Failed payload keys: ${Object.keys(updates).join(', ')}`);
+            console.error(`    Failed payload keys: ${updateKeys.join(', ')}`);
             throw updateError;
         } else {
             console.log(` -> [${user.user_email}] Supabase update successful.`);
@@ -199,7 +210,6 @@ export const processUser = async (user, forceRun = false) => {
         supabaseUpdateSuccess = false;
     }
 
+    // Return true only if the Supabase update succeeded
     return supabaseUpdateSuccess;
 };
-
-// Removed the duplicate export line below
