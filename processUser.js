@@ -94,7 +94,7 @@ export const processUser = async (user, forceRun = false) => {
     categoriesToProcess.forEach((cat) => {
         if (cat.needsApiCall) {
             openServProcessingAttempted = true;
-            const prompt = `Give me news Titled ${cat.name} News : This will only contain news that happened today on the following crypto topics/items {${cat.items.join(', ')}} with each news section having a why it matters part`;
+            const prompt = `Give me WEB 3/CRYPTO only news Titled ${cat.name} News : This will only contain news that happened today on the following crypto topics/items {${cat.items.join(', ')}} with each news section having a why it matters part`;
              console.log(`   - Queuing POST for ${cat.name}`);
             // Use the general agent ID for all content types
             postPromises.push(postMessage(cat.workspaceId, config.openservAgentId, prompt));
