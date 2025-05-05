@@ -94,7 +94,7 @@ export const processUser = async (user, forceRun = false) => {
     categoriesToProcess.forEach((cat) => {
         if (cat.needsApiCall) {
             openServProcessingAttempted = true;
-            const prompt = `Give me Crypto/web3 related news Titled ${cat.name} News : This will only contain news that happened today on the following crypto topics/items {${cat.items.join(', ')}} with each news section having a why it matters part`;
+            const prompt = `Give me Web3 related news Titled ${cat.name} News : This will only contain Web3/Crypto news that happened today on the following crypto topics/items {${cat.items.join(', ')}} with each news section having a why it matters part`;
              console.log(`   - Queuing POST for ${cat.name}`);
             postPromises.push(postMessage(cat.workspaceId, config.openservAgentId, prompt));
             categoryInfoForGet.push({ ...cat });
@@ -202,4 +202,4 @@ export const processUser = async (user, forceRun = false) => {
     return supabaseUpdateSuccess;
 };
 
-export { needsScheduledUpdate, needsImmediateUpdate };
+// Removed the duplicate export line below
