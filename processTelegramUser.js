@@ -1,6 +1,3 @@
-// ================================================
-// FILE: processTelegramUser.js
-// ================================================
 import { supabase } from './supabaseClient.js';
 import { postMessage } from './openservClient.js';
 import { processUser } from './processUser.js';
@@ -10,18 +7,25 @@ const PLACEHOLDER_MESSAGE = "Please Select A Preference To View Personalized New
 const ERROR_FETCHING_PREFIX = "Error fetching";
 
 function isValidContent(content) {
-    return content && content !== PLACEHOLDER_MESSAGE && !content.startsWith(ERROR_FETCHING_PREFIX);
+    return content && content !== PLACEHOLDER_MESSAGE && !content.startsWith(ERROR_FETCHING_PREFIX) && content.trim().length > 0;
 }
 
 function hasValidContentForTelegram(user) {
-     return isValidContent(user.watchlist) || isValidContent(user.sector) || isValidContent(user.narrative);
+     const hasWatchlist = isValidContent(user.watchlist);
+     const hasSector = isValidContent(user.sector);
+     const hasNarrative = isValidContent(user.narrative);
+     return hasWatchlist || hasSector || hasNarrative;
 }
 
+
 function isContentStale(user) {
-     if (!user.last_job) return true;
+     if (!user.last_job) {
+         return true;
+     }
      const lastJobTime = new Date(user.last_job);
      const threshold = new Date(Date.now() - config.jobRefreshHours * 60 * 60 * 1000);
-     return lastJobTime < threshold;
+     const stale = lastJobTime < threshold;
+     return stale;
 }
 
 function shouldAttemptTelegramSend(user) {
@@ -30,18 +34,21 @@ function shouldAttemptTelegramSend(user) {
     }
 
     if (!hasValidContentForTelegram(user)) {
+         console.log(` -> [TG/${user.user_email}] Skipping Send: No valid content available.`);
         return false;
     }
 
     if (user.tele_last_sent) {
         const lastSentTime = new Date(user.tele_last_sent);
-        const threshold = new Date(Date.now() - config.jobRefreshHours * 60 * 60 * 1000);
+        const threshold = new Date(Date.now() - config.telegramSendIntervalHours * 60 * 60 * 1000);
         if (lastSentTime >= threshold) {
             return false;
         }
+    } else {
     }
     return true;
 }
+
 
 export const processTelegramUser = async (user, usersCurrentlyProcessingContent) => {
     if (!user || !user.ispro || !user.telegramid) {
@@ -49,41 +56,46 @@ export const processTelegramUser = async (user, usersCurrentlyProcessingContent)
     }
 
     let currentUserData = user;
+    const userLogPrefix = ` -> [TG/${currentUserData.user_email}]`;
 
     if (isContentStale(currentUserData)) {
         if (usersCurrentlyProcessingContent.has(currentUserData.user_email)) {
-             // console.log(` -> [TG/${currentUserData.user_email}] Content processing already in progress, skipping Telegram for now.`);
              return;
         }
-        console.log(` -> [TG/${currentUserData.user_email}] Content is stale. Triggering refresh...`);
-        usersCurrentlyProcessingContent.add(currentUserData.user_email); // Lock
+        console.log(`${userLogPrefix} Content is stale or potentially missing. Triggering background refresh...`);
+        usersCurrentlyProcessingContent.add(currentUserData.user_email);
         let refreshSuccessful = false;
+        const refreshStartTime = new Date();
+
         try {
-            refreshSuccessful = await processUser(currentUserData, true); // Force run
+            await processUser(currentUserData, true);
+            console.log(`${userLogPrefix} Background content refresh attempt finished.`);
+             const { data: refreshedUser, error: fetchError } = await supabase
+                 .from('user_preferences')
+                 .select('user_email, telegramid, watchlist, sector, narrative, tele_last_sent, ispro, last_job')
+                 .eq('user_email', currentUserData.user_email)
+                 .single();
+
+             if (fetchError || !refreshedUser) {
+                 console.error(`${userLogPrefix} Error refetching user data after refresh attempt: ${fetchError?.message || 'User not found'}. Using potentially stale data for this cycle.`);
+             } else {
+                  if (refreshedUser.last_job && new Date(refreshedUser.last_job) >= refreshStartTime) {
+                       console.log(`${userLogPrefix} Content refresh confirmed via refetch. Proceeding with updated data.`);
+                       currentUserData = refreshedUser;
+                       refreshSuccessful = true;
+                  } else {
+                       console.warn(`${userLogPrefix} Refetched data, but last_job timestamp suggests refresh might not have completed/updated successfully yet. Using potentially stale data.`);
+                       currentUserData = refreshedUser;
+                  }
+             }
+
         } catch (refreshError) {
-            console.error(` -> [TG/${currentUserData.user_email}] Error during forced content refresh: ${refreshError.message}.`);
+            console.error(`${userLogPrefix} Error during background content refresh trigger: ${refreshError.message}.`);
         } finally {
-            usersCurrentlyProcessingContent.delete(currentUserData.user_email); // Unlock
-        }
-
-        if (refreshSuccessful) {
-             // console.log(` -> [TG/${currentUserData.user_email}] Content refresh successful. Refetching data...`);
-            const { data: refreshedUser, error: fetchError } = await supabase
-                .from('user_preferences')
-                .select('user_email, telegramid, watchlist, sector, narrative, tele_last_sent, ispro, last_job')
-                .eq('user_email', currentUserData.user_email)
-                .single();
-
-            if (fetchError || !refreshedUser) {
-                console.error(` -> [TG/${currentUserData.user_email}] Error refetching user data after refresh: ${fetchError?.message || 'User not found'}. Skipping Telegram send.`);
-                return;
-            }
-            currentUserData = refreshedUser;
-        } else {
-             console.warn(` -> [TG/${currentUserData.user_email}] Content refresh failed or skipped. Skipping Telegram send.`);
-             return;
+            usersCurrentlyProcessingContent.delete(currentUserData.user_email);
         }
     }
+
 
     if (!shouldAttemptTelegramSend(currentUserData)) {
         return;
@@ -102,37 +114,45 @@ export const processTelegramUser = async (user, usersCurrentlyProcessingContent)
     combinedNews = combinedNews.trim();
 
     if (!combinedNews) {
+         console.log(`${userLogPrefix} No valid, combined content to send.`);
         return;
     }
 
-    const prompt = `this is the news for today {${combinedNews}} form a concise message from this and send it to user id {${currentUserData.telegramid}} , title it as Degen Times - Daily Digest`;
+    const prompt = `this is the news for today {${combinedNews}} form a very concise and creative message from this and send it to user id {${currentUserData.telegramid}} , title it as Degen Times - Daily Digest`;
 
-    let postAttempted = false;
+    let postSuccessful = false;
     try {
+        console.log(`${userLogPrefix} Attempting POST to Telegram agent for user ID ${currentUserData.telegramid}.`);
         await postMessage(
             config.openservWorkspaceIdTelegram,
             config.openservAgentIdTelegram,
             prompt
         );
-        postAttempted = true;
+        console.log(`${userLogPrefix} POST to Telegram agent successful.`);
+        postSuccessful = true;
     } catch (error) {
-        postAttempted = true;
-        console.error(` -> [TG/${currentUserData.user_email}] Error sending POST to Telegram agent: ${error.message}`);
+        console.error(`${userLogPrefix} Error sending POST to Telegram agent: ${error.message}`);
+        postSuccessful = false;
     }
 
-    if (postAttempted) {
+    if (postSuccessful) {
+        const newTimestamp = new Date().toISOString();
         try {
-            const newTimestamp = new Date().toISOString();
+            console.log(`${userLogPrefix} Updating tele_last_sent timestamp to ${newTimestamp}.`);
             const { error: updateError } = await supabase
                 .from('user_preferences')
                 .update({ tele_last_sent: newTimestamp })
                 .eq('user_email', currentUserData.user_email);
 
             if (updateError) {
-                throw updateError;
+                console.error(`!!! ${userLogPrefix} Supabase update for tele_last_sent FAILED:`, updateError.message);
+            } else {
+                console.log(`${userLogPrefix} Supabase update for tele_last_sent successful.`);
             }
         } catch (error) {
-            console.error(` -> [TG/${currentUserData.user_email}] Error updating tele_last_sent in Supabase:`, error.message);
+             console.error(`!!! ${userLogPrefix} CRITICAL: Error during Supabase update operation for tele_last_sent:`, error.message);
         }
+    } else {
+         console.log(`${userLogPrefix} Skipping tele_last_sent update because POST to agent failed.`);
     }
 };
