@@ -1,6 +1,3 @@
-// ================================================
-// FILE: worker.js
-// ================================================
 import http from 'http';
 import { supabase } from './supabaseClient.js';
 import { processUser, needsScheduledUpdate, needsImmediateUpdate } from './processUser.js';
@@ -17,7 +14,7 @@ let immediateCheckTimeoutId = null;
 let telegramJobTimeoutId = null;
 let midnightRefreshTimeoutId = null;
 
-const usersCurrentlyProcessingContent = new Set(); // Lock for processUser calls
+const usersCurrentlyProcessingContent = new Set();
 
 const server = http.createServer((req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -52,7 +49,6 @@ async function runScheduledContentCycle() {
         return;
     }
     isScheduledContentJobRunning = true;
-    // console.log(`\n============ [ScheduledContentJob ${new Date().toISOString()}] Starting Cycle ============`);
 
     try {
         const { data: users, error } = await supabase
@@ -61,22 +57,27 @@ async function runScheduledContentCycle() {
             .eq('ispro', true);
 
         if (error) {
-            console.error(" -> Error fetching users for scheduled content:", error.message);
+            console.error("[ScheduledContentJob] Error fetching users:", error.message);
         } else if (users && users.length > 0) {
             for (const user of users) {
-                 if (usersCurrentlyProcessingContent.has(user.user_email)) continue; // Skip if already processing
+                 if (usersCurrentlyProcessingContent.has(user.user_email)) {
+                     continue;
+                 }
                  if (needsScheduledUpdate(user)) {
-                      usersCurrentlyProcessingContent.add(user.user_email); // Lock
-                      try { await processUser(user); }
-                      catch (userError) { console.error(`!!! [ScheduledContentJob] Error processing ${user.user_email}:`, userError.message); }
-                      finally { usersCurrentlyProcessingContent.delete(user.user_email); } // Unlock
+                      usersCurrentlyProcessingContent.add(user.user_email);
+                      try {
+                          await processUser(user);
+                      } catch (userError) {
+                          console.error(`!!! [ScheduledContentJob] Error processing ${user.user_email}:`, userError.message);
+                      } finally {
+                          usersCurrentlyProcessingContent.delete(user.user_email);
+                      }
                  }
             }
         }
     } catch (cycleError) {
         console.error(`!!! [ScheduledContentJob] Critical error during cycle:`, cycleError.message, cycleError.stack);
     } finally {
-        // console.log(`============ [ScheduledContentJob ${new Date().toISOString()}] Cycle Ended ============`);
         isScheduledContentJobRunning = false;
         scheduleNextScheduledContentRun();
     }
@@ -102,16 +103,21 @@ async function runImmediateCheckCycle() {
             .eq('ispro', true);
 
         if (error) {
-            console.error(" -> Error fetching users for immediate check:", error.message);
+            console.error("[ImmediateCheck] Error fetching users:", error.message);
         } else if (users && users.length > 0) {
              for (const user of users) {
-                 if (usersCurrentlyProcessingContent.has(user.user_email)) continue; // Skip if already processing
+                 if (usersCurrentlyProcessingContent.has(user.user_email)) {
+                    continue;
+                 }
                  if (needsImmediateUpdate(user)) {
-                      // console.log(` -> [ImmediateCheck] Triggering update for ${user.user_email}`);
-                      usersCurrentlyProcessingContent.add(user.user_email); // Lock
-                      try { await processUser(user); }
-                      catch (userError) { console.error(`!!! [ImmediateCheck] Error processing ${user.user_email}:`, userError.message); }
-                      finally { usersCurrentlyProcessingContent.delete(user.user_email); } // Unlock
+                      usersCurrentlyProcessingContent.add(user.user_email);
+                      try {
+                          await processUser(user);
+                      } catch (userError) {
+                           console.error(`!!! [ImmediateCheck] Error processing ${user.user_email}:`, userError.message);
+                      } finally {
+                           usersCurrentlyProcessingContent.delete(user.user_email);
+                      }
                  }
              }
         }
@@ -144,11 +150,14 @@ async function runTelegramJobCycle() {
              .not('telegramid', 'is', null);
 
          if (error) {
-             console.error(" -> Error fetching users for Telegram:", error.message);
+             console.error("[TelegramJob] Error fetching users:", error.message);
          } else if (users && users.length > 0) {
-             for (const user of users) { // Process sequentially
-                 try { await processTelegramUser(user, usersCurrentlyProcessingContent); } // Pass lock Set
-                 catch (userError) { console.error(`!!! [TelegramJob] Error processing Telegram for ${user.user_email}:`, userError.message); }
+             for (const user of users) {
+                 try {
+                     await processTelegramUser(user, usersCurrentlyProcessingContent);
+                 } catch (userError) {
+                     console.error(`!!! [TelegramJob] Uncaught error processing Telegram for ${user.user_email}:`, userError.message);
+                 }
              }
          }
      } catch (cycleError) {
@@ -167,7 +176,7 @@ async function runTelegramJobCycle() {
 
 async function runMidnightRefresh() {
     if (isMidnightRefreshRunning) {
-        scheduleNextMidnightRefresh(); // Reschedule anyway
+        scheduleNextMidnightRefresh();
         return;
     }
     isMidnightRefreshRunning = true;
@@ -176,26 +185,25 @@ async function runMidnightRefresh() {
     try {
         const { data: users, error } = await supabase
             .from('user_preferences')
-            .select('user_email, preferences, ispro, watchlist, sector, narrative, last_job, preference_update') // Select all needed by processUser
+            .select('user_email, preferences, ispro, watchlist, sector, narrative, last_job, preference_update')
             .eq('ispro', true);
 
         if (error) {
             console.error(" -> Error fetching users for midnight refresh:", error.message);
         } else if (users && users.length > 0) {
              console.log(` -> Found ${users.length} Pro users for midnight refresh.`);
-             // Use Promise.allSettled for concurrency but track locks
              const processingPromises = users.map(async (user) => {
                   if (usersCurrentlyProcessingContent.has(user.user_email)) {
                        console.log(` -> [MidnightRefresh] Skipping ${user.user_email}, already processing.`);
-                       return; // Skip if locked
+                       return;
                   }
-                  usersCurrentlyProcessingContent.add(user.user_email); // Lock before async call
+                  usersCurrentlyProcessingContent.add(user.user_email);
                   try {
-                       await processUser(user, true); // Force run
+                       await processUser(user, true);
                   } catch (userError) {
                        console.error(`!!! [MidnightRefresh] Error processing ${user.user_email}:`, userError.message);
                   } finally {
-                       usersCurrentlyProcessingContent.delete(user.user_email); // Unlock in finally
+                       usersCurrentlyProcessingContent.delete(user.user_email);
                   }
              });
              await Promise.allSettled(processingPromises);
@@ -222,26 +230,6 @@ function scheduleNextMidnightRefresh() {
     londonTomorrowMidnight.setDate(londonTomorrowMidnight.getDate() + 1);
     londonTomorrowMidnight.setHours(0, 0, 0, 0);
 
-    // Convert London midnight back to the server's local time to calculate the delay
-    // Note: This assumes the server's clock is reasonably accurate.
-    // Getting the *actual* UTC time corresponding to London midnight:
-    const tomorrowMidnightUTC = new Date(
-        Date.UTC(
-            londonTomorrowMidnight.getFullYear(),
-            londonTomorrowMidnight.getMonth(),
-            londonTomorrowMidnight.getDate(),
-            0, 0, 0
-        )
-    );
-    // Need to adjust based on London's offset *at that future time* (DST matters)
-    // A simpler way is to get tomorrow midnight in London string, then parse
-    const londonTomorrowMidnightStr = `${londonTomorrowMidnight.getFullYear()}-${String(londonTomorrowMidnight.getMonth() + 1).padStart(2, '0')}-${String(londonTomorrowMidnight.getDate()).padStart(2, '0')}T00:00:00`;
-
-    // Use Date.parse on a string known to be in London time (requires robust parsing or library)
-    // *Simplification:* Calculate delay based on current offset idea. This is less robust across DST changes.
-    // A better approach uses a library like date-fns-tz or luxon.
-    // Sticking to basic JS for now:
-
     const msUntilMidnight = londonTomorrowMidnight.getTime() - londonNow.getTime();
 
     console.log(`[Scheduler] Scheduling next Midnight Refresh in ${Math.round(msUntilMidnight / 1000 / 60)} minutes (at ${londonTomorrowMidnight.toLocaleString()})`);
@@ -259,7 +247,7 @@ console.log(` - Midnight Refresh Timezone: ${config.londonTimezone}`);
 runScheduledContentCycle();
 runImmediateCheckCycle();
 runTelegramJobCycle();
-scheduleNextMidnightRefresh(); // Initial schedule for midnight
+scheduleNextMidnightRefresh();
 
 function shutdown(signal) {
     console.log(`[Process] ${signal} signal received. Shutting down gracefully.`);
