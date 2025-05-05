@@ -54,6 +54,7 @@ export function needsImmediateUpdate(user) {
      return false;
 }
 
+
 export const processUser = async (user, forceRun = false) => {
     const runReason = forceRun ? "Forced Run"
                      : needsImmediateUpdate(user) ? "Immediate Update"
@@ -77,6 +78,8 @@ export const processUser = async (user, forceRun = false) => {
 
     const { watchlistItems = [], selectedSectors = [], selectedNarratives = [] } = preferences;
     const updates = {};
+    let openServProcessingAttempted = false;
+    let openServProcessingSucceededOverall = true;
 
     const categoriesToProcess = [
         { name: 'Watchlist', items: watchlistItems, workspaceId: config.openservWorkspaceIdWatchlist, updateKey: 'watchlist', needsApiCall: watchlistItems.length > 0 },
@@ -84,23 +87,26 @@ export const processUser = async (user, forceRun = false) => {
         { name: 'Narrative', items: selectedNarratives, workspaceId: config.openservWorkspaceIdNarrative, updateKey: 'narrative', needsApiCall: selectedNarratives.length > 0 }
     ];
 
+
     const postPromises = [];
     const categoryInfoForGet = [];
 
     categoriesToProcess.forEach((cat) => {
         if (cat.needsApiCall) {
+            openServProcessingAttempted = true;
             const prompt = `Give me news Titled ${cat.name} News : This will only contain news that happened today on the following crypto topics/items {${cat.items.join(', ')}} with each news section having a why it matters part`;
              console.log(`   - Queuing POST for ${cat.name}`);
             postPromises.push(postMessage(cat.workspaceId, config.openservAgentId, prompt));
             categoryInfoForGet.push({ ...cat });
         } else {
              console.log(`   - Setting placeholder for ${cat.name} (no items)`);
-            updates[cat.updateKey] = PLACEHOLDER_MESSAGE;
+            if (user[cat.updateKey] !== PLACEHOLDER_MESSAGE) {
+                updates[cat.updateKey] = PLACEHOLDER_MESSAGE;
+            }
         }
     });
 
     let postResults = [];
-    let processingSucceeded = true;
 
     if (postPromises.length > 0) {
          console.log(` -> Waiting for ${postPromises.length} POST requests to settle...`);
@@ -113,7 +119,7 @@ export const processUser = async (user, forceRun = false) => {
             } else {
                 console.error(`    - POST for ${catInfo.name} failed: ${result.reason?.message || result.reason}`);
                 updates[catInfo.updateKey] = `${ERROR_FETCHING_PREFIX} ${catInfo.name.toLowerCase()} news generation.`;
-                processingSucceeded = false;
+                openServProcessingSucceededOverall = false;
             }
         });
 
@@ -147,18 +153,18 @@ export const processUser = async (user, forceRun = false) => {
                              updates[catInfo.updateKey] = agentResponse;
                          } else {
                               console.warn(`    - GET for ${catInfo.name} successful, but no agent response found.`);
-                             updates[catInfo.updateKey] = null;
+                             updates[catInfo.updateKey] = PLACEHOLDER_MESSAGE;
                          }
                      } else {
                          console.error(`    - GET for ${catInfo.name} failed: ${getResult.reason?.message || getResult.reason}`);
                          updates[catInfo.updateKey] = `${ERROR_FETCHING_PREFIX} ${catInfo.name.toLowerCase()} news result.`;
-                         processingSucceeded = false;
+                         openServProcessingSucceededOverall = false;
                      }
                  });
             }
         } else {
              console.warn(` -> Skipping GET requests as all POSTs failed.`);
-             processingSucceeded = false;
+             openServProcessingSucceededOverall = false;
         }
     } else {
         console.log(` -> No API calls needed for this user.`);
@@ -166,6 +172,13 @@ export const processUser = async (user, forceRun = false) => {
 
     updates.last_job = new Date().toISOString();
 
+    if (Object.keys(updates).length === 0) {
+         console.log(` -> [${user.user_email}] No changes detected, skipping Supabase update.`);
+         return true;
+    }
+
+
+    let supabaseUpdateSuccess = false;
     try {
         console.log(` -> Updating Supabase for ${user.user_email} with keys: ${Object.keys(updates).join(', ')}`);
         const { error: updateError } = await supabase
@@ -174,12 +187,19 @@ export const processUser = async (user, forceRun = false) => {
             .eq('user_email', user.user_email);
 
         if (updateError) {
+            console.error(`!!! [${user.user_email}] Supabase update FAILED:`, updateError.message);
+            console.error(`    Failed payload keys: ${Object.keys(updates).join(', ')}`);
             throw updateError;
+        } else {
+            console.log(` -> [${user.user_email}] Supabase update successful.`);
+            supabaseUpdateSuccess = true;
         }
-        console.log(` -> [${user.user_email}] Supabase update successful.`);
-        return processingSucceeded;
     } catch (error) {
-        console.error(` -> [${user.user_email}] Error updating Supabase:`, error.message);
-        return false;
+        console.error(` -> [${user.user_email}] CRITICAL: Error during Supabase update operation:`, error.message);
+        supabaseUpdateSuccess = false;
     }
+
+    return supabaseUpdateSuccess;
 };
+
+export { needsScheduledUpdate, needsImmediateUpdate };
