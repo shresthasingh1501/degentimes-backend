@@ -1,6 +1,3 @@
-// ================================================
-// FILE: config.js
-// ================================================
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -16,20 +13,23 @@ const config = {
   openservWorkspaceIdNarrative: process.env.OPENSERV_WORKSPACE_ID_NARRATIVE || '3421',
   openservWorkspaceIdTelegram: process.env.OPENSERV_WORKSPACE_ID_TELEGRAM || '3416',
   openservAgentIdTelegram: process.env.OPENSERV_AGENT_ID_TELEGRAM || '267',
-  jobIntervalMs: parseInt(process.env.JOB_INTERVAL_MS || '21600000', 10), // Default 6 hours for scheduled
-  instantCheckIntervalMs: parseInt(process.env.INSTANT_CHECK_INTERVAL_MS || '5000', 10), // 5 seconds
+  jobIntervalMs: parseInt(process.env.JOB_INTERVAL_MS || '21600000', 10),
+  instantCheckIntervalMs: parseInt(process.env.INSTANT_CHECK_INTERVAL_MS || '5000', 10),
   openservWaitMs: parseInt(process.env.OPENSERV_WAIT_MS || '65000', 10),
-  jobRefreshHours: parseInt(process.env.JOB_REFRESH_HOURS || '6', 10), // 6 hours
+  jobRefreshHours: parseInt(process.env.JOB_REFRESH_HOURS || '6', 10),
   londonTimezone: 'Europe/London',
-  telegramJobIntervalMs: parseInt(process.env.TELEGRAM_JOB_INTERVAL_MS || '1000', 10), // 1 second
-  telegramSendIntervalHours: parseInt(process.env.TELEGRAM_SEND_INTERVAL_HOURS || '6', 10), // Based on content refresh
+  telegramJobIntervalMs: parseInt(process.env.TELEGRAM_JOB_INTERVAL_MS || '15000', 10),
+  telegramSendIntervalHours: parseInt(process.env.TELEGRAM_SEND_INTERVAL_HOURS || '6', 10),
   port: process.env.PORT || 3001,
 };
 
+
 for (const [key, value] of Object.entries(config)) {
     if (value === undefined || value === null || value === '') {
-        if (key !== 'openservConnectSid') {
-        } else if (key === 'openservConnectSid' && (!value || value.length < 5)) {
+        if (key === 'openservConnectSid' && (!value || value.length < 5)) {
+
+        } else if (key !== 'openservConnectSid') {
+
         }
     }
     if((key.startsWith('openservWorkspaceId') || key.startsWith('openservAgentId')) && typeof value === 'string' && isNaN(parseInt(value, 10))) {
@@ -42,6 +42,7 @@ for (const [key, value] of Object.entries(config)) {
      }
 }
 
+
 if (!config.supabaseUrl || !config.supabaseServiceKey || !config.openservApiKey ) {
     console.error("Error: Critical environment variables (Supabase URL/Service Key, OpenServ API Key) are missing. Exiting.");
     process.exit(1);
@@ -50,5 +51,6 @@ if (!config.openservWorkspaceIdTelegram || !config.openservAgentIdTelegram) {
      console.error("Error: Telegram agent/workspace IDs are missing. Exiting.");
      process.exit(1);
 }
+
 
 export default config;
