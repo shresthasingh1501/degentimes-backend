@@ -1,14 +1,58 @@
-// ================================================
-// FILE: processUser.js
-// ================================================
 import { supabase } from './supabaseClient.js';
 import { postMessage, getMessages, getLastAgentMessage, wait } from './openservClient.js';
-import config from './config.js'; // Assuming config is needed later
+import config from './config.js';
 
 const PLACEHOLDER_MESSAGE = "Please Select A Preference To View Personalized News Here";
 const ERROR_FETCHING_PREFIX = "Error fetching";
 
-// ... (keep the needsScheduledUpdate and needsImmediateUpdate functions as they are) ...
+export function needsScheduledUpdate(user) {
+    if (!user || !user.ispro) return false;
+
+    const now = new Date();
+    const jobRefreshThreshold = new Date(now.getTime() - config.jobRefreshHours * 60 * 60 * 1000);
+
+    if (user.last_job) {
+        const lastJobTime = new Date(user.last_job);
+        if (lastJobTime < jobRefreshThreshold) {
+            return true;
+        }
+
+        if (user.preference_update) {
+            const prefUpdateTime = new Date(user.preference_update);
+            if (prefUpdateTime > lastJobTime) {
+                 return true;
+            }
+        }
+        return false;
+    } else {
+        return true;
+    }
+}
+
+export function needsImmediateUpdate(user) {
+     if (!user || !user.ispro) return false;
+
+     if (!user.last_job) {
+          return true;
+     }
+
+     if (user.preference_update) {
+          const prefUpdateTime = new Date(user.preference_update);
+          const lastJobTime = new Date(user.last_job);
+          if (prefUpdateTime > lastJobTime) {
+               return true;
+          }
+     }
+
+     const needsFilling = !user.watchlist || user.watchlist === PLACEHOLDER_MESSAGE ||
+                         !user.sector || user.sector === PLACEHOLDER_MESSAGE ||
+                         !user.narrative || user.narrative === PLACEHOLDER_MESSAGE;
+     if (needsFilling) {
+         return true;
+     }
+
+     return false;
+}
 
 export const processUser = async (user, forceRun = false) => {
     const runReason = forceRun ? "Forced Run"
@@ -21,31 +65,19 @@ export const processUser = async (user, forceRun = false) => {
     }
     console.log(`\n--- Processing User: ${user.user_email} (Reason: ${runReason}) ---`);
 
-    // --- MODIFIED PREFERENCES HANDLING ---
-    let preferences = user.preferences; // Get the value from the fetched user object
+    let preferences = user.preferences;
 
     if (preferences === null || typeof preferences === 'undefined') {
-        // If preferences field is explicitly null or doesn't exist
         console.warn(` -> [${user.user_email}] Preferences field is null or undefined. Treating as empty.`);
-        preferences = {}; // Default to an empty object
+        preferences = {};
     } else if (typeof preferences !== 'object') {
-        // If it exists but isn't an object (e.g., string, number)
-        // This might indicate a data type issue in Supabase (e.g., TEXT instead of JSONB)
         console.error(` -> [${user.user_email}] Preferences field is not an object (type: ${typeof preferences}). Check DB schema/data. Treating as empty.`);
-        // Optionally log the actual value for debugging, careful with sensitive data:
-        // console.error(`   Value received:`, preferences);
-        preferences = {}; // Default to an empty object
-        // You *could* decide to return false here if this indicates a critical data error:
-        // return false;
+        preferences = {};
     }
-    // Now, 'preferences' is guaranteed to be an object, even if empty.
-    // The original try/catch block around this specific part is no longer needed.
 
-    // Destructuring will now safely default to empty arrays if the properties don't exist
     const { watchlistItems = [], selectedSectors = [], selectedNarratives = [] } = preferences;
-    const updates = {}; // Object to hold columns to update in Supabase
+    const updates = {};
 
-    // Define categories and check if they have items to process
     const categoriesToProcess = [
         { name: 'Watchlist', items: watchlistItems, workspaceId: config.openservWorkspaceIdWatchlist, updateKey: 'watchlist', needsApiCall: watchlistItems.length > 0 },
         { name: 'Sector', items: selectedSectors, workspaceId: config.openservWorkspaceIdSector, updateKey: 'sector', needsApiCall: selectedSectors.length > 0 },
@@ -55,32 +87,25 @@ export const processUser = async (user, forceRun = false) => {
     const postPromises = [];
     const categoryInfoForGet = [];
 
-    // Initiate POST requests for categories that need processing
     categoriesToProcess.forEach((cat) => {
         if (cat.needsApiCall) {
             const prompt = `Give me news Titled ${cat.name} News : This will only contain news that happened today on the following crypto topics/items {${cat.items.join(', ')}} with each news section having a why it matters part`;
-             console.log(`   - Queuing POST for ${cat.name}`); // Added log
+             console.log(`   - Queuing POST for ${cat.name}`);
             postPromises.push(postMessage(cat.workspaceId, config.openservAgentId, prompt));
             categoryInfoForGet.push({ ...cat });
         } else {
-             // If no items, set the placeholder message directly
-             console.log(`   - Setting placeholder for ${cat.name} (no items)`); // Added log
+             console.log(`   - Setting placeholder for ${cat.name} (no items)`);
             updates[cat.updateKey] = PLACEHOLDER_MESSAGE;
         }
     });
 
-    // ... (rest of the processUser function remains the same) ...
-    // ... (handling postResults, getResults, and Supabase update) ...
-
     let postResults = [];
-    let processingSucceeded = true; // Assume success unless an API call fails critically
+    let processingSucceeded = true;
 
-    // If there were POST requests to make
     if (postPromises.length > 0) {
          console.log(` -> Waiting for ${postPromises.length} POST requests to settle...`);
         postResults = await Promise.allSettled(postPromises);
 
-        // Process results of POST requests
         postResults.forEach((result, index) => {
             const catInfo = categoryInfoForGet[index];
             if (result.status === 'fulfilled') {
