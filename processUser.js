@@ -1,55 +1,73 @@
-// processUser.js
+// ================================================
+// FILE: processUser.js
+// ================================================
 import { supabase } from './supabaseClient.js';
 import { postMessage, getMessages, getLastAgentMessage, wait } from './openservClient.js';
 import config from './config.js';
 
-/**
- * Checks if a job needs to run for a user based on conditions.
- * (No changes needed in this function)
- */
-function shouldRunJob(user) {
+const PLACEHOLDER_MESSAGE = "Please Select A Preference To View Personalized News Here";
+const ERROR_FETCHING_PREFIX = "Error fetching";
+
+function needsScheduledUpdate(user) {
     if (!user || !user.ispro) return false;
-    const needsFilling = !user.watchlist || !user.sector || !user.narrative;
-    if (needsFilling) {
-        console.log(` -> [${user.user_email}] Job needed: Content field(s) are null or placeholder.`);
-        return true;
-    }
+
     const now = new Date();
     const jobRefreshThreshold = new Date(now.getTime() - config.jobRefreshHours * 60 * 60 * 1000);
+
     if (user.last_job) {
         const lastJobTime = new Date(user.last_job);
         if (lastJobTime < jobRefreshThreshold) {
-            console.log(` -> [${user.user_email}] Job needed: Last run (${lastJobTime.toISOString()}) > ${config.jobRefreshHours} hours ago.`);
             return true;
         }
+
         if (user.preference_update) {
             const prefUpdateTime = new Date(user.preference_update);
             if (prefUpdateTime > lastJobTime) {
-                 console.log(` -> [${user.user_email}] Job needed: Preferences updated (${prefUpdateTime.toISOString()}) after last job (${lastJobTime.toISOString()}).`);
                  return true;
             }
         }
+        return false;
     } else {
-        console.log(` -> [${user.user_email}] Job needed: Content fields exist but last_job is null (running once).`);
         return true;
     }
-    // console.log(` -> [${user.user_email}] Job not needed (conditions: initial fill, ${config.jobRefreshHours}hr refresh, pref update check).`);
-    return false;
 }
 
-const PLACEHOLDER_MESSAGE = "Please Select A Preference To View Personalized News Here";
+function needsImmediateUpdate(user) {
+     if (!user || !user.ispro) return false;
 
-/**
- * Processes a single user: checks eligibility, calls OpenServ APIs concurrently *only for categories with preferences*,
- * sets placeholders for empty preferences, updates Supabase.
- */
-export const processUser = async (user) => {
-    if (!shouldRunJob(user)) {
-        return; // Exit if conditions not met
+     if (!user.last_job) {
+          return true;
+     }
+
+     if (user.preference_update) {
+          const prefUpdateTime = new Date(user.preference_update);
+          const lastJobTime = new Date(user.last_job);
+          if (prefUpdateTime > lastJobTime) {
+               return true;
+          }
+     }
+
+     const needsFilling = !user.watchlist || user.watchlist === PLACEHOLDER_MESSAGE ||
+                         !user.sector || user.sector === PLACEHOLDER_MESSAGE ||
+                         !user.narrative || user.narrative === PLACEHOLDER_MESSAGE;
+     if (needsFilling) {
+         return true;
+     }
+
+     return false;
+}
+
+export const processUser = async (user, forceRun = false) => {
+    const runReason = forceRun ? "Forced Run"
+                     : needsImmediateUpdate(user) ? "Immediate Update"
+                     : needsScheduledUpdate(user) ? "Scheduled Update"
+                     : null;
+
+    if (!runReason) {
+        return false;
     }
-    console.log(`\n--- Processing User: ${user.user_email} ---`);
+    // console.log(`\n--- Processing User: ${user.user_email} (Reason: ${runReason}) ---`);
 
-    // --- 1. Extract Preferences ---
     let preferences;
     try {
         preferences = user.preferences;
@@ -57,120 +75,89 @@ export const processUser = async (user) => {
             throw new Error("Invalid or missing preferences object.");
         }
     } catch (e) {
-        console.error(` -> [${user.user_email}] Error parsing preferences: ${e.message}. Skipping content generation.`);
-        return;
+        console.error(` -> [${user.user_email}] Error parsing preferences: ${e.message}.`);
+        return false;
     }
 
     const { watchlistItems = [], selectedSectors = [], selectedNarratives = [] } = preferences;
-    const updates = {}; // Store final results for Supabase
+    const updates = {};
 
-    // Define categories and check if they need API calls
     const categoriesToProcess = [
         { name: 'Watchlist', items: watchlistItems, workspaceId: config.openservWorkspaceIdWatchlist, updateKey: 'watchlist', needsApiCall: watchlistItems.length > 0 },
         { name: 'Sector', items: selectedSectors, workspaceId: config.openservWorkspaceIdSector, updateKey: 'sector', needsApiCall: selectedSectors.length > 0 },
         { name: 'Narrative', items: selectedNarratives, workspaceId: config.openservWorkspaceIdNarrative, updateKey: 'narrative', needsApiCall: selectedNarratives.length > 0 }
     ];
 
-    // --- 2. Prepare & Execute Parallel POST Requests (only for eligible categories) ---
-    console.log(` -> [${user.user_email}] Preparing API calls based on preferences...`);
     const postPromises = [];
-    const categoryInfoForGet = []; // Store info needed for GET calls later
+    const categoryInfoForGet = [];
 
-    categoriesToProcess.forEach((cat, index) => {
+    categoriesToProcess.forEach((cat) => {
         if (cat.needsApiCall) {
-            console.log(`    - Scheduling API call for ${cat.name}.`);
             const prompt = `Give me news Titled ${cat.name} News : This will only contain news that happened today on the following crypto topics/items {${cat.items.join(', ')}} with each news section having a why it matters part`;
             postPromises.push(postMessage(cat.workspaceId, config.openservAgentId, prompt));
-            categoryInfoForGet.push({ ...cat, originalIndex: index }); // Store details
+            categoryInfoForGet.push({ ...cat });
         } else {
-            console.log(`    - Setting placeholder for ${cat.name} (no preferences).`);
-            updates[cat.updateKey] = PLACEHOLDER_MESSAGE; // Set placeholder directly
-            // Add a resolved promise to keep array lengths consistent if needed, or handle indices carefully
-            // postPromises.push(Promise.resolve({ status: 'skipped_no_pref' })); // Placeholder if needed for indexing
+            updates[cat.updateKey] = PLACEHOLDER_MESSAGE;
         }
     });
 
-    // Only proceed with API calls if there's anything to call
     let postResults = [];
+    let processingSucceeded = true; // Assume success unless an API call fails critically
+
     if (postPromises.length > 0) {
-        console.log(` -> [${user.user_email}] Sending ${postPromises.length} POST requests in parallel...`);
         postResults = await Promise.allSettled(postPromises);
 
-        // Log POST results (correlating back using categoryInfoForGet)
         postResults.forEach((result, index) => {
-            const catInfo = categoryInfoForGet[index]; // Info for the *called* API
+            const catInfo = categoryInfoForGet[index];
             if (result.status === 'fulfilled') {
-                console.log(`    - POST for ${catInfo.name} successful.`);
             } else {
                 console.error(`    - POST for ${catInfo.name} failed: ${result.reason?.message || result.reason}`);
-                // Set error message immediately if POST fails
-                updates[catInfo.updateKey] = `Error initiating ${catInfo.name.toLowerCase()} news fetch. Please try again later.`;
+                updates[catInfo.updateKey] = `${ERROR_FETCHING_PREFIX} ${catInfo.name.toLowerCase()} news generation.`;
+                processingSucceeded = false; // Mark as failed if POST fails
             }
         });
 
-        // --- 3. Wait Period ---
-        console.log(` -> [${user.user_email}] Waiting ${config.openservWaitMs / 1000}s for agents to process...`);
-        await wait(config.openservWaitMs);
+        if (postResults.some(r => r.status === 'fulfilled')) {
+            await wait(config.openservWaitMs);
 
-        // --- 4. Prepare & Execute Parallel GET Requests (only for successful POSTs) ---
-        console.log(` -> [${user.user_email}] Sending GET requests in parallel...`);
-        const getPromises = [];
-        const categoryInfoForUpdate = []; // Track which updates correspond to GET results
+            const getPromises = [];
+            const categoryInfoForUpdate = [];
 
-        postResults.forEach((postResult, index) => {
-            const catInfo = categoryInfoForGet[index];
-            // Only attempt GET if the POST was fulfilled
-            if (postResult.status === 'fulfilled') {
-                console.log(`    - Scheduling GET for ${catInfo.name}...`);
-                getPromises.push(getMessages(catInfo.workspaceId, config.openservAgentId));
-                categoryInfoForUpdate.push(catInfo); // Track this category for update
-            } else {
-                // POST failed, error message already set in 'updates' object
-                console.log(`    - Skipping GET for ${catInfo.name} (POST failed).`);
-            }
-        });
+            postResults.forEach((postResult, index) => {
+                const catInfo = categoryInfoForGet[index];
+                if (postResult.status === 'fulfilled') {
+                    getPromises.push(getMessages(catInfo.workspaceId, config.openservAgentId));
+                    categoryInfoForUpdate.push(catInfo);
+                }
+            });
 
-        if (getPromises.length > 0) {
-            const getResults = await Promise.allSettled(getPromises);
+            if (getPromises.length > 0) {
+                const getResults = await Promise.allSettled(getPromises);
 
-             // --- 5. Collate GET Results ---
-             getResults.forEach((getResult, index) => {
-                 const catInfo = categoryInfoForUpdate[index]; // Info for the *called* GET
-                 if (getResult.status === 'fulfilled') {
-                     const messages = getResult.value; // Array of messages
-                     const agentResponse = getLastAgentMessage(messages);
-                     if (agentResponse) {
-                         console.log(`    - GET for ${catInfo.name} successful, response found.`);
-                         updates[catInfo.updateKey] = agentResponse; // Assign message
+                 getResults.forEach((getResult, index) => {
+                     const catInfo = categoryInfoForUpdate[index];
+                     if (getResult.status === 'fulfilled') {
+                         const messages = getResult.value;
+                         const agentResponse = getLastAgentMessage(messages);
+                         if (agentResponse) {
+                             updates[catInfo.updateKey] = agentResponse;
+                         } else {
+                             updates[catInfo.updateKey] = null;
+                         }
                      } else {
-                         console.warn(`    - GET for ${catInfo.name} successful, but no agent response found.`);
-                         updates[catInfo.updateKey] = null; // Set to null if no response found
+                         console.error(`    - GET for ${catInfo.name} failed: ${getResult.reason?.message || getResult.reason}`);
+                         updates[catInfo.updateKey] = `${ERROR_FETCHING_PREFIX} ${catInfo.name.toLowerCase()} news result.`;
+                         processingSucceeded = false; // Mark as failed if GET fails
                      }
-                 } else {
-                     // GET promise was rejected
-                     console.error(`    - GET for ${catInfo.name} failed: ${getResult.reason?.message || getResult.reason}`);
-                     updates[catInfo.updateKey] = `Error fetching ${catInfo.name.toLowerCase()} news result. Please try again later.`;
-                 }
-             });
+                 });
+            }
         } else {
-             console.log(` -> [${user.user_email}] No successful POSTs, skipping all GET requests.`);
+             processingSucceeded = false; // Mark as failed if no POSTs were successful
         }
 
-    } else {
-        console.log(` -> [${user.user_email}] No API calls needed based on preferences.`);
     }
 
-
-    // --- 6. Update Supabase ---
-    updates.last_job = new Date().toISOString(); // Always update last_job timestamp
-
-    // Log the final updates being sent (excluding potentially large content)
-    const updateSummary = Object.keys(updates)
-        .filter(k => k !== 'watchlist' && k !== 'sector' && k !== 'narrative')
-        .reduce((acc, key) => { acc[key] = updates[key]; return acc; }, {});
-    updateSummary.content_keys = Object.keys(updates).filter(k => ['watchlist', 'sector', 'narrative'].includes(k));
-    console.log(` -> [${user.user_email}] Preparing Supabase update with keys: ${Object.keys(updates).join(', ')}`);
-
+    updates.last_job = new Date().toISOString();
 
     try {
         const { error: updateError } = await supabase
@@ -181,10 +168,10 @@ export const processUser = async (user) => {
         if (updateError) {
             throw updateError;
         }
-        console.log(` -> [${user.user_email}] Supabase update successful.`);
+        // console.log(` -> [${user.user_email}] Supabase update successful.`);
+        return processingSucceeded; // Return true if all API steps that were attempted succeeded
     } catch (error) {
         console.error(` -> [${user.user_email}] Error updating Supabase:`, error.message);
+        return false; // Indicate failure
     }
-
-    console.log(`--- Finished Processing User: ${user.user_email} ---`);
 };
