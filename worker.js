@@ -1,25 +1,21 @@
 import http from 'http';
 import { supabase } from './supabaseClient.js';
 import { processUser, needsScheduledUpdate, needsImmediateUpdate } from './processUser.js';
-// Removed import { processTelegramUser } from './processTelegramUser.js';
 import config from './config.js';
 
-// State variables for content jobs
+// --- State Variables --- // Ensure these are at the top level
 let isScheduledContentJobRunning = false;
 let isImmediateContentCheckRunning = false;
 let isMidnightRefreshRunning = false;
-// Removed isTelegramJobRunning
 
-// Timeout IDs for scheduling
 let scheduledContentTimeoutId = null;
 let immediateCheckTimeoutId = null;
 let midnightRefreshTimeoutId = null;
-// Removed telegramJobTimeoutId
 
-// Lock to prevent concurrent processing for the same user
 const usersCurrentlyProcessingContent = new Set();
 
-// Simple HTTP server for health checks
+// --- HTTP Server Setup ---
+console.log("[Startup] Initializing HTTP server..."); // Log: Server init start
 const server = http.createServer((req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -33,238 +29,233 @@ const server = http.createServer((req, res) => {
             status: 'ok',
             scheduledContentJobRunning: isScheduledContentJobRunning,
             immediateContentCheckRunning: isImmediateContentCheckRunning,
-            // Removed telegramJobRunning
             midnightRefreshRunning: isMidnightRefreshRunning,
             nextScheduledContentRunScheduled: scheduledContentTimeoutId !== null,
             nextImmediateCheckScheduled: immediateCheckTimeoutId !== null,
-            // Removed nextTelegramRunScheduled
             nextMidnightRefreshScheduled: midnightRefreshTimeoutId !== null,
             usersProcessingContent: Array.from(usersCurrentlyProcessingContent),
+            twitterIntegrationEnabled: !!(config.openservTwitterApiKey && config.openservTwitterAgentId && config.openservTwitterConnectSid),
+            geminiIntegrationEnabled: !!config.geminiApiKey,
+            telegramIntegrationEnabled: !!(config.openservTelegramAgentId && config.openservTelegramWorkspaceId),
         }));
     } else { res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not Found'); }
 });
-server.listen(config.port, () => { console.log(`[HTTP Server] Listening on port ${config.port}`); });
-server.on('error', (error) => { console.error('[HTTP Server] Server Error:', error); });
 
+server.on('error', (error) => { // Catch server errors
+    console.error('[HTTP Server] Critical Server Error:', error);
+    // Consider exiting if the server fails critically
+    // process.exit(1);
+});
 
-// --- Scheduled Content Processing Cycle ---
+server.on('listening', () => { // Log: Explicit confirmation
+    console.log(`[HTTP Server] Successfully listening on port ${config.port}`);
+});
+
+// --- Database Columns ---
+const USER_COLUMNS_TO_SELECT = [
+    'user_email', 'preferences', 'ispro',
+    'last_job', 'ai_last_update', 'preference_update',
+    'telegramid', 'tele_last_sent',
+    'watchlist', 'sector', 'narrative',
+    'watchlist_intel', 'sector_intel', 'narrative_intel',
+    'watchlist_social', 'sector_social', 'narrative_social'
+].join(', ');
+
+// --- Job Cycle Functions ---
+
 async function runScheduledContentCycle() {
+    console.log("[ScheduledContentJob] Cycle function entered."); // Log: Cycle Start
     if (isScheduledContentJobRunning) {
+        console.log("[ScheduledContentJob] Already running, rescheduling.");
         scheduleNextScheduledContentRun();
         return;
     }
     isScheduledContentJobRunning = true;
-    console.log(`\n============ [ScheduledContentJob ${new Date().toISOString()}] Starting Cycle ============`);
-
+    console.log(`\n============ [ScheduledContentJob ${new Date().toISOString()}] Starting ============`);
     try {
-        // Select fields needed for processUser and its checks
-        const { data: users, error } = await supabase
-            .from('user_preferences')
-            .select('user_email, preferences, ispro, watchlist, sector, narrative, last_job, preference_update')
-            .eq('ispro', true); // Only process Pro users
-
+        console.log("[ScheduledContentJob] Fetching users..."); // Log: Inside Try
+        const { data: users, error } = await supabase.from('user_preferences').select(USER_COLUMNS_TO_SELECT).eq('ispro', true);
         if (error) {
             console.error("[ScheduledContentJob] Error fetching users:", error.message);
         } else if (users && users.length > 0) {
             console.log(`[ScheduledContentJob] Found ${users.length} Pro users to check.`);
             for (const user of users) {
                  if (usersCurrentlyProcessingContent.has(user.user_email)) {
-                     // console.log(`[ScheduledContentJob] Skipping ${user.user_email}, already processing.`);
-                     continue; // Skip if already being processed (e.g., by immediate check)
+                     continue;
                  }
-                 // Check if this user needs a scheduled update
                  if (needsScheduledUpdate(user)) {
-                      usersCurrentlyProcessingContent.add(user.user_email); // Lock user processing
+                      usersCurrentlyProcessingContent.add(user.user_email);
                       try {
-                          console.log(`[ScheduledContentJob] Processing ${user.user_email}...`);
-                          await processUser(user); // Process the user's content
-                      } catch (userError) {
-                          // Catch errors specific to this user's processing
-                          console.error(`!!! [ScheduledContentJob] Error processing ${user.user_email}:`, userError.message);
-                      } finally {
-                          usersCurrentlyProcessingContent.delete(user.user_email); // Unlock user processing
+                          console.log(`[ScheduledContentJob] Calling processUser for ${user.user_email}...`); // Log: Before processUser call
+                          await processUser(user, false, "Scheduled Update");
+                          console.log(`[ScheduledContentJob] processUser finished for ${user.user_email}.`); // Log: After processUser call
+                      }
+                      catch (userError) { console.error(`!!! [ScheduledJob] Error processing ${user.user_email}:`, userError.message, userError.stack); }
+                      finally {
+                          usersCurrentlyProcessingContent.delete(user.user_email);
                       }
                  }
             }
-            console.log(`[ScheduledContentJob] Finished checking users.`);
-        } else {
-            console.log("[ScheduledContentJob] No Pro users found.");
-        }
-    } catch (cycleError) {
-        // Catch critical errors in the overall cycle (e.g., Supabase connection)
-        console.error(`!!! [ScheduledContentJob] Critical error during cycle:`, cycleError.message, cycleError.stack);
-    } finally {
-        console.log(`============ [ScheduledContentJob ${new Date().toISOString()}] Cycle Ended ============`);
+             console.log("[ScheduledContentJob] Finished user loop."); // Log: After Loop
+        } else console.log("[ScheduledContentJob] No Pro users found.");
+    } catch (cycleError) { console.error(`!!! [ScheduledJob] Critical cycle error:`, cycleError.message, cycleError.stack); }
+    finally {
+        console.log(`============ [ScheduledContentJob ${new Date().toISOString()}] Ended - Scheduling next run... ============`); // Log: Finally Start
         isScheduledContentJobRunning = false;
-        scheduleNextScheduledContentRun(); // Schedule the next run
+        scheduleNextScheduledContentRun(); // Schedule next
     }
 }
 
 function scheduleNextScheduledContentRun() {
     if (scheduledContentTimeoutId) clearTimeout(scheduledContentTimeoutId);
-    console.log(`[Scheduler] Scheduling next Scheduled Content Job in ${config.jobIntervalMs / 1000 / 60} minutes.`);
+    console.log(`[Scheduler] Scheduling next Scheduled Content Job in ${config.jobIntervalMs / 1000 / 60} minutes.`); // Log: Scheduling
     scheduledContentTimeoutId = setTimeout(runScheduledContentCycle, config.jobIntervalMs);
 }
 
-
-// --- Immediate Content Check Cycle ---
 async function runImmediateCheckCycle() {
+    // console.log("[ImmediateCheck] Cycle function entered."); // Can be too noisy, enable if needed
     if (isImmediateContentCheckRunning) {
+        // console.log("[ImmediateCheck] Already running, rescheduling.");
         scheduleNextImmediateCheck();
         return;
     }
     isImmediateContentCheckRunning = true;
-    // No start/end logs for this frequent check unless debugging
-
     try {
-        // Select fields needed for processUser and its checks
-        const { data: users, error } = await supabase
-            .from('user_preferences')
-            .select('user_email, preferences, ispro, watchlist, sector, narrative, last_job, preference_update')
-            .eq('ispro', true); // Only process Pro users
-
+        const { data: users, error } = await supabase.from('user_preferences').select(USER_COLUMNS_TO_SELECT).eq('ispro', true);
         if (error) {
-            console.error("[ImmediateCheck] Error fetching users:", error.message);
+             console.error("[ImmediateCheck] Error fetching users:", error.message);
         } else if (users && users.length > 0) {
              for (const user of users) {
-                 if (usersCurrentlyProcessingContent.has(user.user_email)) {
-                    // console.log(`[ImmediateCheck] Skipping ${user.user_email}, already processing.`);
-                    continue; // Skip if already being processed
-                 }
-                 // Check if this user needs an immediate update (new prefs, missing content)
+                 if (usersCurrentlyProcessingContent.has(user.user_email)) continue;
                  if (needsImmediateUpdate(user)) {
-                      console.log(` -> [ImmediateCheck] Triggering update for ${user.user_email}`);
-                      usersCurrentlyProcessingContent.add(user.user_email); // Lock user processing
+                      usersCurrentlyProcessingContent.add(user.user_email);
                       try {
-                          // console.log(`[ImmediateCheck] Processing ${user.user_email}...`);
-                          await processUser(user); // Process the user's content
-                      } catch (userError) {
-                           console.error(`!!! [ImmediateCheck] Error processing ${user.user_email}:`, userError.message);
-                      } finally {
-                           usersCurrentlyProcessingContent.delete(user.user_email); // Unlock user processing
+                          // console.log(` -> [ImmediateCheck] Calling processUser for ${user.user_email}`); // Log: Before processUser call
+                          await processUser(user, false, "Immediate Update");
+                          // console.log(` -> [ImmediateCheck] processUser finished for ${user.user_email}.`); // Log: After processUser call
+                      }
+                      catch (userError) { console.error(`!!! [ImmediateCheck] Error processing ${user.user_email}:`, userError.message, userError.stack); }
+                      finally {
+                          usersCurrentlyProcessingContent.delete(user.user_email);
                       }
                  }
              }
         }
-    } catch (cycleError) {
-        console.error(`!!! [ImmediateCheck] Critical error during cycle:`, cycleError.message, cycleError.stack);
-    } finally {
+    } catch (cycleError) { console.error(`!!! [ImmediateCheck] Critical cycle error:`, cycleError.message, cycleError.stack); }
+    finally {
+        // console.log("[ImmediateCheck] Cycle ended - Scheduling next run."); // Can be too noisy
         isImmediateContentCheckRunning = false;
-        scheduleNextImmediateCheck(); // Schedule the next check
+        scheduleNextImmediateCheck(); // Schedule next
     }
 }
 
 function scheduleNextImmediateCheck() {
     if (immediateCheckTimeoutId) clearTimeout(immediateCheckTimeoutId);
-    // No logging for this frequent schedule
+    // console.log("[Scheduler] Scheduling next Immediate Check."); // Noisy
     immediateCheckTimeoutId = setTimeout(runImmediateCheckCycle, config.instantCheckIntervalMs);
 }
 
-// --- Removed Telegram Job Cycle ---
-
-
-// --- Midnight Refresh Cycle (Force updates for all Pro users) ---
 async function runMidnightRefresh() {
+    console.log("[MidnightRefresh] Cycle function entered."); // Log: Cycle Start
     if (isMidnightRefreshRunning) {
-        scheduleNextMidnightRefresh(); // Reschedule anyway
+        console.log("[MidnightRefresh] Already running, rescheduling.");
+        scheduleNextMidnightRefresh();
         return;
     }
     isMidnightRefreshRunning = true;
-    console.log(`\n============ [MidnightRefresh ${new Date().toISOString()}] Starting Cycle ============`);
-
+    console.log(`\n============ [MidnightRefresh ${new Date().toISOString()}] Starting ============`);
     try {
-        // Select all fields needed by processUser
-        const { data: users, error } = await supabase
-            .from('user_preferences')
-            .select('user_email, preferences, ispro, watchlist, sector, narrative, last_job, preference_update')
-            .eq('ispro', true); // Only refresh Pro users
-
+        console.log("[MidnightRefresh] Fetching users..."); // Log: Inside Try
+        const { data: users, error } = await supabase.from('user_preferences').select(USER_COLUMNS_TO_SELECT).eq('ispro', true);
         if (error) {
-            console.error(" -> Error fetching users for midnight refresh:", error.message);
+            console.error("[MidnightRefresh] Error fetching users:", error.message);
         } else if (users && users.length > 0) {
-             console.log(` -> Found ${users.length} Pro users for midnight refresh.`);
-             // Process users concurrently, managing locks
-             const processingPromises = users.map(async (user) => {
+             console.log(`[MidnightRefresh] Found ${users.length} Pro users for refresh.`);
+             const promises = users.map(async (user) => {
                   if (usersCurrentlyProcessingContent.has(user.user_email)) {
-                       console.log(` -> [MidnightRefresh] Skipping ${user.user_email}, already processing.`);
-                       return; // Skip if locked (e.g., by immediate check)
+                      return;
                   }
-                  usersCurrentlyProcessingContent.add(user.user_email); // Lock before async call
+                  usersCurrentlyProcessingContent.add(user.user_email);
                   try {
-                       console.log(` -> [MidnightRefresh] Force-processing ${user.user_email}...`);
-                       await processUser(user, true); // Force run processUser
-                  } catch (userError) {
-                       console.error(`!!! [MidnightRefresh] Error processing ${user.user_email}:`, userError.message);
-                  } finally {
-                       usersCurrentlyProcessingContent.delete(user.user_email); // Unlock in finally
+                       console.log(`[MidnightRefresh] Calling processUser (forced) for ${user.user_email}...`); // Log: Before processUser call
+                       await processUser(user, true);
+                       console.log(`[MidnightRefresh] processUser finished for ${user.user_email}.`); // Log: After processUser call
+                  }
+                  catch (userError) { console.error(`!!! [MidnightRefresh] Error processing ${user.user_email}:`, userError.message, userError.stack); }
+                  finally {
+                       usersCurrentlyProcessingContent.delete(user.user_email);
                   }
              });
-             // Wait for all processing attempts to settle
-             await Promise.allSettled(processingPromises);
-             console.log(` -> Finished midnight refresh processing loop.`);
-        } else {
-             console.log(" -> No Pro users found for midnight refresh.");
-        }
-    } catch (cycleError) {
-        console.error(`!!! [MidnightRefresh] Critical error during cycle:`, cycleError.message, cycleError.stack);
-    } finally {
-        console.log(`============ [MidnightRefresh ${new Date().toISOString()}] Cycle Ended ============`);
+             await Promise.allSettled(promises);
+             console.log("[MidnightRefresh] Finished user loop processing."); // Log: After Loop
+        } else console.log("[MidnightRefresh] No Pro users found.");
+    } catch (cycleError) { console.error(`!!! [MidnightRefresh] Critical cycle error:`, cycleError.message, cycleError.stack); }
+    finally {
+        console.log(`============ [MidnightRefresh ${new Date().toISOString()}] Ended - Scheduling next run... ============`); // Log: Finally Start
         isMidnightRefreshRunning = false;
-        scheduleNextMidnightRefresh(); // Schedule the next midnight run
+        scheduleNextMidnightRefresh(); // Schedule next
     }
 }
 
 function scheduleNextMidnightRefresh() {
     if (midnightRefreshTimeoutId) clearTimeout(midnightRefreshTimeoutId);
-
     const now = new Date();
-    // Get current time in London
     const londonNow = new Date(now.toLocaleString('en-US', { timeZone: config.londonTimezone }));
-
-    // Calculate next midnight in London
     const londonTomorrowMidnight = new Date(londonNow);
     londonTomorrowMidnight.setDate(londonTomorrowMidnight.getDate() + 1);
     londonTomorrowMidnight.setHours(0, 0, 0, 0);
-
-    // Calculate delay from London's current time to London's next midnight
     const msUntilMidnight = londonTomorrowMidnight.getTime() - londonNow.getTime();
-
-    console.log(`[Scheduler] Scheduling next Midnight Refresh in ${Math.round(msUntilMidnight / 1000 / 60)} minutes (at ${londonTomorrowMidnight.toLocaleString()})`);
+    console.log(`[Scheduler] Scheduling next Midnight Refresh in ${Math.round(msUntilMidnight / 1000 / 60)} minutes.`); // Log: Scheduling
     midnightRefreshTimeoutId = setTimeout(runMidnightRefresh, msUntilMidnight);
 }
 
-
 // --- Worker Initialization ---
-console.log("Starting DegenTimes Content Worker Process...");
-console.log(` - Scheduled Content Job Interval: ${config.jobIntervalMs / 1000}s (${config.jobRefreshHours} hours)`);
-console.log(` - Immediate Content Check Interval: ${config.instantCheckIntervalMs / 1000}s`);
-// Removed Telegram logs
-console.log(` - Midnight Refresh Timezone: ${config.londonTimezone}`);
+console.log("[Startup] Starting DegenTimes Content Worker Process...");
+console.log(` - Scheduled Job Interval: ${config.jobIntervalMs / 1000}s`);
+console.log(` - Immediate Check Interval: ${config.instantCheckIntervalMs / 1000}s`);
+if (config.openservTwitterApiKey) console.log(` - Twitter Social Processing: ENABLED`); else console.log(` - Twitter Social Processing: DISABLED`);
+if (config.geminiApiKey) console.log(` - Gemini AI Insights: ENABLED (Model: ${config.geminiModelId})`); else console.log(` - Gemini AI Insights: DISABLED`);
+if (config.openservTelegramAgentId && config.openservTelegramWorkspaceId) console.log(` - Telegram Sending: ENABLED (Agent: ${config.openservTelegramAgentId}, WS: ${config.openservTelegramWorkspaceId}, Interval: ${config.telegramSendIntervalHours}h)`); else console.log(` - Telegram Sending: DISABLED`);
 
-// Start the job cycles
-runScheduledContentCycle();
-runImmediateCheckCycle();
-// Removed runTelegramJobCycle();
-scheduleNextMidnightRefresh(); // Initial schedule for midnight
+console.log("[Startup] Starting HTTP server listener..."); // Log: Before server listen
+server.listen(config.port); // Initiate listen
+
+console.log("[Startup] Initiating first job cycles..."); // Log: Before initial calls
+try {
+    runScheduledContentCycle(); // Starts the first cycle immediately
+    runImmediateCheckCycle(); // Starts the first cycle immediately
+    scheduleNextMidnightRefresh(); // Schedules the first midnight run
+    console.log("[Startup] Initial job cycles initiated."); // Log: After initial calls
+} catch (startupError) {
+    console.error("!!! [Startup] Error during initial job cycle initiation:", startupError);
+    process.exit(1); // Exit if startup calls fail critically
+}
 
 // --- Graceful Shutdown ---
 function shutdown(signal) {
-    console.log(`[Process] ${signal} signal received. Shutting down gracefully...`);
-    server.close(() => { console.log('[HTTP Server] Closed.'); });
-
-    // Clear all scheduled timeouts
-    if (scheduledContentTimeoutId) clearTimeout(scheduledContentTimeoutId);
-    if (immediateCheckTimeoutId) clearTimeout(immediateCheckTimeoutId);
-    // Removed telegramJobTimeoutId clear
-    if (midnightRefreshTimeoutId) clearTimeout(midnightRefreshTimeoutId);
-
-    // Allow time for current operations to potentially finish (optional)
-    console.log("[Process] Waiting briefly before exit...");
-    setTimeout(() => {
-        console.log("[Process] Exiting.");
-        process.exit(0);
-    }, 1500); // Wait 1.5 seconds
+    console.log(`[Process] ${signal} received. Shutting down...`);
+    server.close((err) => { // Add error handling for server close
+        if (err) {
+            console.error('[HTTP Server] Error closing server:', err);
+        } else {
+            console.log('[HTTP Server] Closed.');
+        }
+     });
+    clearTimeout(scheduledContentTimeoutId); clearTimeout(immediateCheckTimeoutId); clearTimeout(midnightRefreshTimeoutId);
+    console.log("[Process] Cleared timers. Waiting briefly before exit...");
+    setTimeout(() => { console.log("[Process] Exiting."); process.exit(0); }, 2500);
 }
-
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// --- Global Error Handlers ---
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('!!! [Process] Unhandled Rejection at:', promise, 'reason:', reason);
+  // process.exit(1); // Consider exiting
+});
+process.on('uncaughtException', (error) => {
+  console.error('!!! [Process] Uncaught Exception:', error);
+  process.exit(1); // Strongly recommended to exit
+});
+
+console.log("[Startup] Event loop should now be active with server and timers."); // Log: End of synchronous code
