@@ -1,25 +1,21 @@
-// ================================================
-// FILE: worker.js
-// ================================================
 import http from 'http';
 import { supabase } from './supabaseClient.js';
 import { processUser, needsScheduledUpdate, needsImmediateUpdate } from './processUser.js';
-import { processTelegramUser } from './processTelegramUser.js';
 import config from './config.js';
 
+// --- State Variables --- // Ensure these are at the top level
 let isScheduledContentJobRunning = false;
 let isImmediateContentCheckRunning = false;
-let isTelegramJobRunning = false;
 let isMidnightRefreshRunning = false;
 
 let scheduledContentTimeoutId = null;
 let immediateCheckTimeoutId = null;
-let telegramJobTimeoutId = null;
 let midnightRefreshTimeoutId = null;
 
-const usersCurrentlyProcessingContent = new Set(); // Lock for processUser calls
-const FIVE_MINUTES_MS = 5 * 60 * 1000;
+const usersCurrentlyProcessingContent = new Set();
 
+// --- HTTP Server Setup ---
+console.log("[Startup] Initializing HTTP server..."); // Log: Server init start
 const server = http.createServer((req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -33,260 +29,233 @@ const server = http.createServer((req, res) => {
             status: 'ok',
             scheduledContentJobRunning: isScheduledContentJobRunning,
             immediateContentCheckRunning: isImmediateContentCheckRunning,
-            telegramJobRunning: isTelegramJobRunning,
             midnightRefreshRunning: isMidnightRefreshRunning,
             nextScheduledContentRunScheduled: scheduledContentTimeoutId !== null,
             nextImmediateCheckScheduled: immediateCheckTimeoutId !== null,
-            nextTelegramRunScheduled: telegramJobTimeoutId !== null,
             nextMidnightRefreshScheduled: midnightRefreshTimeoutId !== null,
             usersProcessingContent: Array.from(usersCurrentlyProcessingContent),
+            twitterIntegrationEnabled: !!(config.openservTwitterApiKey && config.openservTwitterAgentId && config.openservTwitterConnectSid),
+            geminiIntegrationEnabled: !!config.geminiApiKey,
+            telegramIntegrationEnabled: !!(config.openservTelegramAgentId && config.openservTelegramWorkspaceId),
         }));
     } else { res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not Found'); }
 });
-server.listen(config.port, () => { console.log(`[HTTP Server] Listening on port ${config.port}`); });
-server.on('error', (error) => { console.error('[HTTP Server] Server Error:', error); });
 
+server.on('error', (error) => { // Catch server errors
+    console.error('[HTTP Server] Critical Server Error:', error);
+    // Consider exiting if the server fails critically
+    // process.exit(1);
+});
+
+server.on('listening', () => { // Log: Explicit confirmation
+    console.log(`[HTTP Server] Successfully listening on port ${config.port}`);
+});
+
+// --- Database Columns ---
+const USER_COLUMNS_TO_SELECT = [
+    'user_email', 'preferences', 'ispro',
+    'last_job', 'ai_last_update', 'preference_update',
+    'telegramid', 'tele_last_sent',
+    'watchlist', 'sector', 'narrative',
+    'watchlist_intel', 'sector_intel', 'narrative_intel',
+    'watchlist_social', 'sector_social', 'narrative_social'
+].join(', ');
+
+// --- Job Cycle Functions ---
 
 async function runScheduledContentCycle() {
+    console.log("[ScheduledContentJob] Cycle function entered."); // Log: Cycle Start
     if (isScheduledContentJobRunning) {
+        console.log("[ScheduledContentJob] Already running, rescheduling.");
         scheduleNextScheduledContentRun();
         return;
     }
     isScheduledContentJobRunning = true;
-    // console.log(`\n============ [ScheduledContentJob ${new Date().toISOString()}] Starting Cycle ============`);
-
+    console.log(`\n============ [ScheduledContentJob ${new Date().toISOString()}] Starting ============`);
     try {
-        const { data: users, error } = await supabase
-            .from('user_preferences')
-            .select('user_email, preferences, ispro, watchlist, sector, narrative, last_job, preference_update') // Base fields for processUser
-            .eq('ispro', true);
-
+        console.log("[ScheduledContentJob] Fetching users..."); // Log: Inside Try
+        const { data: users, error } = await supabase.from('user_preferences').select(USER_COLUMNS_TO_SELECT).eq('ispro', true);
         if (error) {
-            console.error(" -> Error fetching users for scheduled content:", error.message);
+            console.error("[ScheduledContentJob] Error fetching users:", error.message);
         } else if (users && users.length > 0) {
+            console.log(`[ScheduledContentJob] Found ${users.length} Pro users to check.`);
             for (const user of users) {
-                 if (usersCurrentlyProcessingContent.has(user.user_email)) continue;
+                 if (usersCurrentlyProcessingContent.has(user.user_email)) {
+                     continue;
+                 }
                  if (needsScheduledUpdate(user)) {
                       usersCurrentlyProcessingContent.add(user.user_email);
-                      try { await processUser(user); }
-                      catch (userError) { console.error(`!!! [ScheduledContentJob] Error processing ${user.user_email}:`, userError.message); }
-                      finally { usersCurrentlyProcessingContent.delete(user.user_email); }
+                      try {
+                          console.log(`[ScheduledContentJob] Calling processUser for ${user.user_email}...`); // Log: Before processUser call
+                          await processUser(user, false, "Scheduled Update");
+                          console.log(`[ScheduledContentJob] processUser finished for ${user.user_email}.`); // Log: After processUser call
+                      }
+                      catch (userError) { console.error(`!!! [ScheduledJob] Error processing ${user.user_email}:`, userError.message, userError.stack); }
+                      finally {
+                          usersCurrentlyProcessingContent.delete(user.user_email);
+                      }
                  }
             }
-        }
-    } catch (cycleError) {
-        console.error(`!!! [ScheduledContentJob] Critical error during cycle:`, cycleError.message, cycleError.stack);
-    } finally {
-        // console.log(`============ [ScheduledContentJob ${new Date().toISOString()}] Cycle Ended ============`);
+             console.log("[ScheduledContentJob] Finished user loop."); // Log: After Loop
+        } else console.log("[ScheduledContentJob] No Pro users found.");
+    } catch (cycleError) { console.error(`!!! [ScheduledJob] Critical cycle error:`, cycleError.message, cycleError.stack); }
+    finally {
+        console.log(`============ [ScheduledContentJob ${new Date().toISOString()}] Ended - Scheduling next run... ============`); // Log: Finally Start
         isScheduledContentJobRunning = false;
-        scheduleNextScheduledContentRun();
+        scheduleNextScheduledContentRun(); // Schedule next
     }
 }
 
 function scheduleNextScheduledContentRun() {
     if (scheduledContentTimeoutId) clearTimeout(scheduledContentTimeoutId);
+    console.log(`[Scheduler] Scheduling next Scheduled Content Job in ${config.jobIntervalMs / 1000 / 60} minutes.`); // Log: Scheduling
     scheduledContentTimeoutId = setTimeout(runScheduledContentCycle, config.jobIntervalMs);
 }
 
-
 async function runImmediateCheckCycle() {
+    // console.log("[ImmediateCheck] Cycle function entered."); // Can be too noisy, enable if needed
     if (isImmediateContentCheckRunning) {
+        // console.log("[ImmediateCheck] Already running, rescheduling.");
         scheduleNextImmediateCheck();
         return;
     }
     isImmediateContentCheckRunning = true;
-
     try {
-        const { data: users, error } = await supabase
-            .from('user_preferences')
-            .select('user_email, preferences, ispro, watchlist, sector, narrative, last_job, preference_update, telegramid, tele_last_sent, telegram_initial_send_scheduled_at') // Added TG related fields
-            .eq('ispro', true);
-
+        const { data: users, error } = await supabase.from('user_preferences').select(USER_COLUMNS_TO_SELECT).eq('ispro', true);
         if (error) {
-            console.error(" -> Error fetching users for immediate check:", error.message);
+             console.error("[ImmediateCheck] Error fetching users:", error.message);
         } else if (users && users.length > 0) {
              for (const user of users) {
-                 // Process content update if needed
-                 if (needsImmediateUpdate(user) && !usersCurrentlyProcessingContent.has(user.user_email)) {
-                      // console.log(` -> [ImmediateCheck/Content] Triggering update for ${user.user_email}`);
+                 if (usersCurrentlyProcessingContent.has(user.user_email)) continue;
+                 if (needsImmediateUpdate(user)) {
                       usersCurrentlyProcessingContent.add(user.user_email);
-                      try { await processUser(user); } // This might update user data, but we use the 'user' var from loop for TG scheduling
-                      catch (userError) { console.error(`!!! [ImmediateCheck/Content] Error processing ${user.user_email}:`, userError.message); }
-                      finally { usersCurrentlyProcessingContent.delete(user.user_email); }
-                 }
-
-                 // Check for initial Telegram send scheduling
-                 if (user.telegramid && !user.telegram_initial_send_scheduled_at) {
-                    console.log(` -> [ImmediateCheck/TG-Initial] New Telegram ID for ${user.user_email}. Scheduling initial send.`);
-                    
-                    // Mark as scheduled immediately to prevent re-scheduling in quick succession
-                    const { error: updateError } = await supabase
-                        .from('user_preferences')
-                        .update({ telegram_initial_send_scheduled_at: new Date().toISOString() })
-                        .eq('user_email', user.user_email);
-
-                    if (updateError) {
-                        console.error(` -> [ImmediateCheck/TG-Initial] Failed to update telegram_initial_send_scheduled_at for ${user.user_email}: ${updateError.message}. Will retry next cycle.`);
-                    } else {
-                        // Clone user object to pass to timeout, ensuring it has all necessary fields for processTelegramUser
-                        const userForTimeout = { ...user }; 
-                        setTimeout(async () => {
-                            console.log(` -> [TG-Initial Job Execute] Running initial Telegram send for ${userForTimeout.user_email}`);
-                            try {
-                                // userForTimeout already contains all fields selected in the immediate check cycle
-                                await processTelegramUser(userForTimeout, usersCurrentlyProcessingContent, true); // true for isInitialSend
-                            } catch (e) {
-                                console.error(` -> [TG-Initial Job Execute] Error during initial Telegram send for ${userForTimeout.user_email}: ${e.message}`);
-                                // Note: telegram_initial_send_scheduled_at is already set.
-                                // If this fails, the "initial" send is missed unless manually reset.
-                            }
-                        }, FIVE_MINUTES_MS);
-                        console.log(` -> [ImmediateCheck/TG-Initial] Scheduled initial Telegram send for ${user.user_email} in 5 minutes.`);
-                    }
+                      try {
+                          // console.log(` -> [ImmediateCheck] Calling processUser for ${user.user_email}`); // Log: Before processUser call
+                          await processUser(user, false, "Immediate Update");
+                          // console.log(` -> [ImmediateCheck] processUser finished for ${user.user_email}.`); // Log: After processUser call
+                      }
+                      catch (userError) { console.error(`!!! [ImmediateCheck] Error processing ${user.user_email}:`, userError.message, userError.stack); }
+                      finally {
+                          usersCurrentlyProcessingContent.delete(user.user_email);
+                      }
                  }
              }
         }
-    } catch (cycleError) {
-        console.error(`!!! [ImmediateCheck] Critical error during cycle:`, cycleError.message, cycleError.stack);
-    } finally {
+    } catch (cycleError) { console.error(`!!! [ImmediateCheck] Critical cycle error:`, cycleError.message, cycleError.stack); }
+    finally {
+        // console.log("[ImmediateCheck] Cycle ended - Scheduling next run."); // Can be too noisy
         isImmediateContentCheckRunning = false;
-        scheduleNextImmediateCheck();
+        scheduleNextImmediateCheck(); // Schedule next
     }
 }
 
 function scheduleNextImmediateCheck() {
     if (immediateCheckTimeoutId) clearTimeout(immediateCheckTimeoutId);
+    // console.log("[Scheduler] Scheduling next Immediate Check."); // Noisy
     immediateCheckTimeoutId = setTimeout(runImmediateCheckCycle, config.instantCheckIntervalMs);
 }
 
-
-async function runTelegramJobCycle() { // This is for REGULAR Telegram sends
-     if (isTelegramJobRunning) {
-         scheduleNextTelegramRun();
-         return;
-     }
-     isTelegramJobRunning = true;
-     // console.log(`\n============ [TelegramJob REGULAR ${new Date().toISOString()}] Starting Cycle ============`);
-
-     try {
-         const { data: users, error } = await supabase
-             .from('user_preferences')
-             .select('user_email, telegramid, watchlist, sector, narrative, tele_last_sent, ispro, last_job') // Fields needed by processTelegramUser
-             .eq('ispro', true)
-             .not('telegramid', 'is', null);
-
-         if (error) {
-             console.error(" -> Error fetching users for REGULAR Telegram:", error.message);
-         } else if (users && users.length > 0) {
-             for (const user of users) {
-                 try {
-                     // Call with isInitialSend = false (default) for regular jobs
-                     await processTelegramUser(user, usersCurrentlyProcessingContent);
-                 }
-                 catch (userError) { console.error(`!!! [TelegramJob REGULAR] Error processing Telegram for ${user.user_email}:`, userError.message); }
-             }
-         }
-     } catch (cycleError) {
-         console.error(`!!! [TelegramJob REGULAR] Critical error during cycle:`, cycleError.message, cycleError.stack);
-     } finally {
-        //  console.log(`============ [TelegramJob REGULAR ${new Date().toISOString()}] Cycle Ended ============`);
-         isTelegramJobRunning = false;
-         scheduleNextTelegramRun();
-     }
- }
-
- function scheduleNextTelegramRun() {
-     if (telegramJobTimeoutId) clearTimeout(telegramJobTimeoutId);
-     telegramJobTimeoutId = setTimeout(runTelegramJobCycle, config.telegramJobIntervalMs);
- }
-
-
 async function runMidnightRefresh() {
+    console.log("[MidnightRefresh] Cycle function entered."); // Log: Cycle Start
     if (isMidnightRefreshRunning) {
+        console.log("[MidnightRefresh] Already running, rescheduling.");
         scheduleNextMidnightRefresh();
         return;
     }
     isMidnightRefreshRunning = true;
-    console.log(`\n============ [MidnightRefresh ${new Date().toISOString()}] Starting Cycle ============`);
-
+    console.log(`\n============ [MidnightRefresh ${new Date().toISOString()}] Starting ============`);
     try {
-        const { data: users, error } = await supabase
-            .from('user_preferences')
-            .select('user_email, preferences, ispro, watchlist, sector, narrative, last_job, preference_update')
-            .eq('ispro', true);
-
+        console.log("[MidnightRefresh] Fetching users..."); // Log: Inside Try
+        const { data: users, error } = await supabase.from('user_preferences').select(USER_COLUMNS_TO_SELECT).eq('ispro', true);
         if (error) {
-            console.error(" -> Error fetching users for midnight refresh:", error.message);
+            console.error("[MidnightRefresh] Error fetching users:", error.message);
         } else if (users && users.length > 0) {
-             console.log(` -> Found ${users.length} Pro users for midnight refresh.`);
-             const processingPromises = users.map(async (user) => {
+             console.log(`[MidnightRefresh] Found ${users.length} Pro users for refresh.`);
+             const promises = users.map(async (user) => {
                   if (usersCurrentlyProcessingContent.has(user.user_email)) {
-                       console.log(` -> [MidnightRefresh] Skipping ${user.user_email}, already processing.`);
-                       return;
+                      return;
                   }
                   usersCurrentlyProcessingContent.add(user.user_email);
                   try {
+                       console.log(`[MidnightRefresh] Calling processUser (forced) for ${user.user_email}...`); // Log: Before processUser call
                        await processUser(user, true);
-                  } catch (userError) {
-                       console.error(`!!! [MidnightRefresh] Error processing ${user.user_email}:`, userError.message);
-                  } finally {
+                       console.log(`[MidnightRefresh] processUser finished for ${user.user_email}.`); // Log: After processUser call
+                  }
+                  catch (userError) { console.error(`!!! [MidnightRefresh] Error processing ${user.user_email}:`, userError.message, userError.stack); }
+                  finally {
                        usersCurrentlyProcessingContent.delete(user.user_email);
                   }
              });
-             await Promise.allSettled(processingPromises);
-             console.log(` -> Finished midnight refresh processing loop.`);
-        } else {
-             console.log(" -> No Pro users found for midnight refresh.");
-        }
-    } catch (cycleError) {
-        console.error(`!!! [MidnightRefresh] Critical error during cycle:`, cycleError.message, cycleError.stack);
-    } finally {
-        console.log(`============ [MidnightRefresh ${new Date().toISOString()}] Cycle Ended ============`);
+             await Promise.allSettled(promises);
+             console.log("[MidnightRefresh] Finished user loop processing."); // Log: After Loop
+        } else console.log("[MidnightRefresh] No Pro users found.");
+    } catch (cycleError) { console.error(`!!! [MidnightRefresh] Critical cycle error:`, cycleError.message, cycleError.stack); }
+    finally {
+        console.log(`============ [MidnightRefresh ${new Date().toISOString()}] Ended - Scheduling next run... ============`); // Log: Finally Start
         isMidnightRefreshRunning = false;
-        scheduleNextMidnightRefresh();
+        scheduleNextMidnightRefresh(); // Schedule next
     }
 }
 
 function scheduleNextMidnightRefresh() {
     if (midnightRefreshTimeoutId) clearTimeout(midnightRefreshTimeoutId);
-
     const now = new Date();
     const londonNow = new Date(now.toLocaleString('en-US', { timeZone: config.londonTimezone }));
-
     const londonTomorrowMidnight = new Date(londonNow);
     londonTomorrowMidnight.setDate(londonTomorrowMidnight.getDate() + 1);
     londonTomorrowMidnight.setHours(0, 0, 0, 0);
-    
     const msUntilMidnight = londonTomorrowMidnight.getTime() - londonNow.getTime();
-
-    console.log(`[Scheduler] Scheduling next Midnight Refresh in ${Math.round(msUntilMidnight / 1000 / 60)} minutes (at ${londonTomorrowMidnight.toLocaleString()})`);
+    console.log(`[Scheduler] Scheduling next Midnight Refresh in ${Math.round(msUntilMidnight / 1000 / 60)} minutes.`); // Log: Scheduling
     midnightRefreshTimeoutId = setTimeout(runMidnightRefresh, msUntilMidnight);
 }
 
+// --- Worker Initialization ---
+console.log("[Startup] Starting DegenTimes Content Worker Process...");
+console.log(` - Scheduled Job Interval: ${config.jobIntervalMs / 1000}s`);
+console.log(` - Immediate Check Interval: ${config.instantCheckIntervalMs / 1000}s`);
+if (config.openservTwitterApiKey) console.log(` - Twitter Social Processing: ENABLED`); else console.log(` - Twitter Social Processing: DISABLED`);
+if (config.geminiApiKey) console.log(` - Gemini AI Insights: ENABLED (Model: ${config.geminiModelId})`); else console.log(` - Gemini AI Insights: DISABLED`);
+if (config.openservTelegramAgentId && config.openservTelegramWorkspaceId) console.log(` - Telegram Sending: ENABLED (Agent: ${config.openservTelegramAgentId}, WS: ${config.openservTelegramWorkspaceId}, Interval: ${config.telegramSendIntervalHours}h)`); else console.log(` - Telegram Sending: DISABLED`);
 
-console.log("Starting DegenTimes Worker Process...");
-console.log(` - Scheduled Content Job Interval: ${config.jobIntervalMs / 1000}s (${config.jobRefreshHours} hours)`);
-console.log(` - Immediate Content Check Interval: ${config.instantCheckIntervalMs / 1000}s`);
-console.log(` - Telegram REGULAR Job Interval: ${config.telegramJobIntervalMs / 1000}s (checks if any user needs regular send)`);
-console.log(` - Telegram Initial Send Delay: ${FIVE_MINUTES_MS / 1000}s (upon new Telegram ID)`);
-console.log(` - Telegram Send Cooldown (Regular): ${config.telegramSendIntervalHours} hours`);
-console.log(` - Midnight Refresh Timezone: ${config.londonTimezone}`);
+console.log("[Startup] Starting HTTP server listener..."); // Log: Before server listen
+server.listen(config.port); // Initiate listen
 
-runScheduledContentCycle();
-runImmediateCheckCycle();
-runTelegramJobCycle(); // For regular sends
-scheduleNextMidnightRefresh();
-
-function shutdown(signal) {
-    console.log(`[Process] ${signal} signal received. Shutting down gracefully.`);
-    server.close(() => { console.log('[HTTP Server] Closed.'); });
-    if (scheduledContentTimeoutId) clearTimeout(scheduledContentTimeoutId);
-    if (immediateCheckTimeoutId) clearTimeout(immediateCheckTimeoutId);
-    if (telegramJobTimeoutId) clearTimeout(telegramJobTimeoutId);
-    if (midnightRefreshTimeoutId) clearTimeout(midnightRefreshTimeoutId);
-    // Note: active 5-minute timeouts for initial TG sends will be lost on shutdown
-    setTimeout(() => process.exit(0), 500);
+console.log("[Startup] Initiating first job cycles..."); // Log: Before initial calls
+try {
+    runScheduledContentCycle(); // Starts the first cycle immediately
+    runImmediateCheckCycle(); // Starts the first cycle immediately
+    scheduleNextMidnightRefresh(); // Schedules the first midnight run
+    console.log("[Startup] Initial job cycles initiated."); // Log: After initial calls
+} catch (startupError) {
+    console.error("!!! [Startup] Error during initial job cycle initiation:", startupError);
+    process.exit(1); // Exit if startup calls fail critically
 }
 
+// --- Graceful Shutdown ---
+function shutdown(signal) {
+    console.log(`[Process] ${signal} received. Shutting down...`);
+    server.close((err) => { // Add error handling for server close
+        if (err) {
+            console.error('[HTTP Server] Error closing server:', err);
+        } else {
+            console.log('[HTTP Server] Closed.');
+        }
+     });
+    clearTimeout(scheduledContentTimeoutId); clearTimeout(immediateCheckTimeoutId); clearTimeout(midnightRefreshTimeoutId);
+    console.log("[Process] Cleared timers. Waiting briefly before exit...");
+    setTimeout(() => { console.log("[Process] Exiting."); process.exit(0); }, 2500);
+}
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// --- Global Error Handlers ---
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('!!! [Process] Unhandled Rejection at:', promise, 'reason:', reason);
+  // process.exit(1); // Consider exiting
+});
+process.on('uncaughtException', (error) => {
+  console.error('!!! [Process] Uncaught Exception:', error);
+  process.exit(1); // Strongly recommended to exit
+});
+
+console.log("[Startup] Event loop should now be active with server and timers."); // Log: End of synchronous code
